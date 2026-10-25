@@ -1,0 +1,14 @@
+{
+  "name": "modworks",
+  "owner": {
+    "name": "gate3"
+  },
+  "description": "Mods for Claude Code, one folder per mod.",
+  "plugins": [
+    {
+      "name": "cost-guard",
+      "source": "./plugins/cost-guard",
+      "description": "Helps long Claude Code sessions use less of your usage limits: a live usage and context pane, automatic handoff to a fresh context at a threshold you pick, and trimmed tool output."
+    }
+  ]
+}
