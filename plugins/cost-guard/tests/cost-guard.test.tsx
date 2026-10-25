@@ -19,7 +19,9 @@ const PANE = {
 const NOTE = 'STATUS: IN_PROGRESS\n## Goal\nShip the cost guard mod\n## Next steps\nRun the tests'
 
 // The engine beneath the plugin: every call the mod makes is answered here.
-function world(on: On) {
+// `beforeNote` runs while the note is being written; `heldPrompts` holds the
+// plugin's own prompts, as the engine does until the session is idle.
+function world(on: On, opts: { beforeNote?: () => Promise<unknown>; heldPrompts?: string[] } = {}) {
   const clock = mock.clock(on, { now: 1_000_000 })
   mock.store(on)
   mock.env(on, { HOME: '/home/test' })
@@ -35,8 +37,9 @@ function world(on: On) {
     seen.writes.push(e.path)
     return { value: undefined }
   })
-  on('model.fork', () => {
+  on('model.fork', async () => {
     seen.forks += 1
+    await opts.beforeNote?.()
     return {
       value: {
         isAnswered: true,
@@ -50,8 +53,12 @@ function world(on: On) {
     return { text: '' }
   })
   on('prompt.submit', (_, e) => {
+    if (opts.heldPrompts && e.origin?.kind === 'plugin') {
+      opts.heldPrompts.push(e.text)
+      return new Promise<never>(() => {})
+    }
     seen.prompts.push(e.text)
-    return { text: e.text }
+    return { text: e.text, context: e.context }
   })
   return { clock, seen }
 }
@@ -227,4 +234,35 @@ test('the chosen handoff point is marked and survives a clear', async ($, on) =>
   expect(await ui.find({ type: 'Text', text: /Hands off at 300K/ })).toBeDefined()
   expect(JSON.stringify(await ui.drawn())).toContain('✓ 300K')
   await ui.unmount()
+})
+
+test('a message sent while the note is written stops the clear', async ($, on) => {
+  // The person replies while the note is being written.
+  const { clock, seen } = world(on, { beforeNote: () => $.turn.start({ turnId: 't2', text: 'Yes, go ahead' }) })
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await measure($, 250_000)
+  await $.turn.complete({ turnId: 't1', reason: 'answer', answer: 'ok', isAborted: false, durationMs: 1_000 })
+  await clock.advance(2_000)
+  expect(seen.forks).toBe(1)
+  expect(seen.commands).toEqual([])
+  expect(seen.prompts).toEqual([])
+})
+
+test('a message that beats the resume prompt carries the note', async ($, on) => {
+  const held: string[] = []
+  const { clock, seen } = world(on, { heldPrompts: held })
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await measure($, 250_000)
+  await $.turn.complete({ turnId: 't1', reason: 'answer', answer: 'ok', isAborted: false, durationMs: 1_000 })
+  await clock.advance(2_000)
+  expect(seen.commands).toEqual(['clear'])
+  expect(held).toHaveLength(1)
+
+  const typed = await $.prompt.submit({ text: 'Make the repo public', origin: { kind: 'composer' }, wait: false })
+  expect(typed.text).toBe('Make the repo public')
+  expect(typed.context?.[0]).toContain('Ship the cost guard mod')
+  expect(typed.context?.[0]).toContain('Answer it, using the note for context')
+
+  const late = await $.prompt.submit({ text: held[0] ?? '', origin: { kind: 'plugin', name: 'cost-guard' }, wait: false })
+  expect(late.drop).toBeDefined()
 })

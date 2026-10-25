@@ -55,6 +55,10 @@ let lastFive = 0
 let limitBump: { at: number; points: number } | undefined
 let hitAt: number | undefined
 let handoffMark: { at: number; freed: number } | undefined
+// Counts the main agent's turns, so a handoff can tell a message came in while it wrote the note.
+let turnsStarted = 0
+// The resume prompt waiting to run after a clear. A message the person sends first carries it instead.
+let pendingResume: { prompt: string; context: string } | undefined
 const agentTypes = new Map<string, string>()
 const routedAgents = new Set<string>()
 
@@ -177,9 +181,21 @@ Carry on from the note:
 If the note lists scheduled loops or check-ins, check CronList and recreate only the ones that are missing. Read files again before editing them.`
 }
 
+// For when the person's message reaches the fresh context before the resume prompt does.
+function resumeContext(note: string, path: string, before: number) {
+  return `[cost-guard handoff] The conversation reached ${tokens(before)} tokens, so cost-guard cleared it to cut cost. The previous session wrote this handoff note (also saved at ${path}):
+
+<handoff-note>
+${note}
+</handoff-note>
+
+The user's message above came in right after the handoff. Answer it, using the note for context. If the note's status is IN_PROGRESS and the message doesn't change the plan, carry on with the note's next steps afterward. If the note lists scheduled loops or check-ins, check CronList and recreate only the ones that are missing. Read files again before editing them.`
+}
+
 async function handOff($: E, why: 'threshold' | 'idle' | 'manual') {
   if (isBusy) return
   isBusy = true
+  const turnsAtStart = turnsStarted
   try {
     const before = (await read($, meterAtom)).tokens
     await update($, phaseAtom, (): Phase => ({ kind: 'writing', since: Date.now() }))
@@ -195,6 +211,12 @@ async function handOff($: E, why: 'threshold' | 'idle' | 'manual') {
     const path = `${dir}/${await stamp($)}.md`
     await $.fs.write(path, note)
 
+    // Clearing now would drop the message the person just sent from its own context.
+    if (isTurnRunning || turnsStarted !== turnsAtStart) {
+      await remember($, 'skip', 'Handoff skipped: you sent a message while the note was being written. Tries again after the next turn.')
+      return
+    }
+
     await update($, phaseAtom, (): Phase => ({ kind: 'clearing', since: Date.now() }))
     await $.command.run({ command: 'clear' })
     await loadSettings($)
@@ -202,7 +224,9 @@ async function handOff($: E, why: 'threshold' | 'idle' | 'manual') {
     freedFrom = before
     // The context is empty now; the next measure fills in the real size.
     await update($, meterAtom, m => ({ ...m, tokens: 0 }))
-    await $.prompt.submit({ text: resumePrompt(note, path, before) })
+    pendingResume = { prompt: resumePrompt(note, path, before), context: resumeContext(note, path, before) }
+    // Runs once the session is idle; the prompt.submit hook hands it to an earlier message instead.
+    void $.prompt.submit({ text: pendingResume.prompt })
 
     await update($, meterAtom, m => ({ ...m, handoffs: m.handoffs + 1 }))
     handoffMark = { at: await $.clock.now(), freed: before }
@@ -657,9 +681,24 @@ export const register: Register = on => {
     return next(e)
   }).catch(($, e, next) => next(e))
 
+  on('prompt.submit', async ($, e, next) => {
+    const isResume = e.origin?.kind === 'plugin' && e.origin.name === 'cost-guard' && e.text.startsWith('[cost-guard handoff]')
+    if (isResume) {
+      // The note already went with the person's message.
+      if (pendingResume === undefined) return { drop: 'The handoff note already went with your message.' }
+      pendingResume = undefined
+      return next(e)
+    }
+    if (pendingResume === undefined || e.command !== undefined || e.isMeta) return next(e)
+    const { context } = pendingResume
+    pendingResume = undefined
+    return next({ ...e, context: [...(e.context ?? []), context] })
+  })
+
   on('turn.start', async ($, e, next) => {
     if (e.agentId === undefined) {
       await loadSettings($)
+      turnsStarted += 1
       isTurnRunning = true
       await update($, runningAtom, () => true)
     }
