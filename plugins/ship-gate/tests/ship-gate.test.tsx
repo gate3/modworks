@@ -31,6 +31,8 @@ function world(on: On) {
     hasRemote: true,
     hasStaging: true,
     branch: 'feature/tour',
+    // git's batch hashing stops at a path it can't hash, like a submodule.
+    batchFails: false,
   }
   const files: Record<string, string> = {}
   const seen = { bash: [] as string[], skillArgs: [] as (string | undefined)[], spawnModels: [] as (string | undefined)[] }
@@ -62,7 +64,7 @@ function world(on: On) {
   on('process.run', (_, e) => {
     const a = e.argv.slice(1).join(' ')
     const cwd = e.init?.cwd ?? '/repo'
-    if (a === 'rev-parse --show-toplevel') return cwd.startsWith('/repo') ? result(0, '/repo\n') : result(128)
+    if (a === 'rev-parse --show-toplevel') return cwd.startsWith('/repo') ? result(0, '/repo\n') : cwd.startsWith('/other') ? result(0, '/other\n') : result(128)
     if (a.startsWith('merge-base HEAD')) return repo.hasRemote ? result(0, 'base0\n') : result(1)
     if (a === 'rev-parse --verify --quiet HEAD' || a === 'rev-parse HEAD') return result(0, 'head0\n')
     if (a === 'rev-parse --abbrev-ref HEAD') return result(0, `${repo.branch}\n`)
@@ -72,7 +74,9 @@ function world(on: On) {
       return result(0, changed().map(p => `${p in repo.work ? (p in repo.base ? 'M' : 'A') : 'D'}\0${p}\0`).join(''))
     }
     if (a === 'ls-files -o --exclude-standard -z') return result(0, [...repo.untracked].map(p => `${p}\0`).join(''))
+    if (a.startsWith('hash-object -w -- ')) return result(0, `${hash(repo.work[e.argv[e.argv.length - 1]!] ?? '')}\n`)
     if (a === 'hash-object -w --stdin-paths') {
+      if (repo.batchFails) return result(128)
       const paths = (e.init?.stdin ?? '').split('\n').filter(Boolean)
       return result(0, `${paths.map(p => hash(repo.work[p] ?? '')).join('\n')}\n`)
     }
@@ -213,6 +217,89 @@ test('a copy-only edit keeps the review; a code edit takes it down', async ($, o
   expect(codeEdit.deny).toContain('- Code review (code changed since then: api.ts)')
 })
 
+test('fixes made in the same turn as a review count as reviewed', async ($, on) => {
+  const { clock, repo } = world(on)
+  repo.work['src/api.ts'] = 'export const limit = 2\n'
+  await start($, clock)
+  await $.skill.prompt({ skill: 'code-review', text: 'Review the diff at high effort.' })
+  await settle(clock)
+
+  repo.work['src/api.ts'] = 'export const limit = 3\n'
+  const fixed = await bash($, 'git commit -am "Limit"')
+  expect(fixed.deny ?? '').not.toContain('- Code review')
+
+  repo.work['src/api.ts'] = 'export const limit = 4\n'
+  const later = await bash($, 'git commit -am "Limit again"')
+  expect(later.deny).toContain('- Code review (code changed since then: api.ts)')
+})
+
+test('JSX text between expressions is copy', async ($, on) => {
+  const { clock, repo } = world(on)
+  repo.work['src/Tour.tsx'] = TOUR.replace('<Text>Hello</Text>', '<Text>{code} applied: you save {off}%.</Text>')
+  await start($, clock)
+  const held = await bash($, 'git commit -am "Tour"')
+  expect(held.deny).toContain('- UX copy check (copy changed in Tour.tsx)')
+})
+
+test('a change inside a code string takes the review down', async ($, on) => {
+  const { clock, repo } = world(on)
+  repo.work['src/api.ts'] = "export const canRefund = (role: string) => role === 'admin'\n"
+  await start($, clock)
+  await doAllSteps($, clock)
+  expect((await bash($, 'git commit -am "Refunds"')).deny ?? '').not.toContain('- Code review')
+
+  repo.work['src/api.ts'] = "export const canRefund = (role: string) => role === 'guest'\n"
+  expect((await bash($, 'git commit -am "Refunds"')).deny).toContain('- Code review (code changed since then: api.ts)')
+})
+
+test('a review covers fixes, not a feature written after it', async ($, on) => {
+  const { clock, repo } = world(on)
+  repo.work['src/api.ts'] = 'export const limit = 2\n'
+  await start($, clock)
+  await $.skill.prompt({ skill: 'code-review', text: 'Review the diff at medium effort.' })
+  await settle(clock)
+
+  repo.untracked.add('src/orders.ts')
+  repo.work['src/orders.ts'] = Array.from({ length: 300 }, (_, i) => `export const o${i} = ${i}`).join('\n')
+  const held = await bash($, 'git add -A && git commit -m "Orders"')
+  expect(held.deny).toContain('- Code review (code changed since then: orders.ts)')
+})
+
+test('a file git hashes alone still takes the review down when it changes', async ($, on) => {
+  const { clock, repo } = world(on)
+  repo.batchFails = true
+  repo.work['src/api.ts'] = 'export const limit = 2\n'
+  await start($, clock)
+  await $.skill.prompt({ skill: 'code-review', text: 'Review.' })
+  await endTurn($, 't1')
+  await settle(clock)
+  expect((await bash($, 'git commit -am "x"')).deny ?? '').not.toContain('- Code review')
+
+  repo.work['src/api.ts'] = 'export const limit = 9\n'
+  expect((await bash($, 'git commit -am "x"')).deny).toContain('- Code review (code changed since then: api.ts)')
+})
+
+test('a gate that fails holds a commit and lets other commands run', async ($, on) => {
+  const { clock, repo, files, seen } = world(on)
+  files['/repo/.claude/ship-gate.json'] = JSON.stringify({ prBase: { branch: 'staging', except: '(' } })
+  repo.work['src/api.ts'] = 'export const limit = 2\n'
+  await start($, clock)
+
+  expect((await bash($, 'gh pr create --title "x"')).deny).toContain("Ship gate couldn't check this command")
+  expect((await bash($, 'ls')).deny).toBeUndefined()
+  expect(seen.bash).toEqual(['ls'])
+})
+
+test('test files are not UX copy', async ($, on) => {
+  const { clock, repo } = world(on)
+  repo.untracked.add('src/Tour.test.tsx')
+  repo.work['src/Tour.test.tsx'] = "test('Shows the welcome line', () => expect(text).toBe('Welcome to your bakery.'))"
+  await start($, clock)
+  const held = await bash($, 'git add -A && git commit -m "Test"')
+  expect(held.deny).not.toContain('UX copy check')
+  expect(held.deny).toContain("Don't ask the user first")
+})
+
 test('yarn is blocked where the lockfile is package-lock.json', async ($, on) => {
   const { clock, files, seen } = world(on)
   files['/repo/package-lock.json'] = '{}'
@@ -266,6 +353,33 @@ test("Claude's code review gets its level and reviewer model from the risk", asy
   await spawn($)
   expect(seen.skillArgs[2]).toBe('max')
   expect(seen.spawnModels[2]).toBeUndefined()
+  await endTurn($, 't3')
+
+  // Other agents in the same turn keep their own model.
+  await $.tool.call({ tool: 'Skill', skill: 'code-review' })
+  await $.agent.spawn({
+    tool_use_id: 'tu2',
+    prompt: 'Find where orders are saved.',
+    description: 'Explore orders',
+    subagentType: 'Explore',
+    provider: { plugin: 'engine', tier: 'core' },
+    parentModel: 'claude-opus-5-5',
+    background: false,
+    fork: false,
+  })
+  expect(seen.spawnModels[3]).toBeUndefined()
+})
+
+test('a review of another repository counts there, not in the one last edited', async ($, on) => {
+  const { clock, repo } = world(on)
+  repo.work['src/api.ts'] = 'export const limit = 2\n'
+  await start($, clock)
+  await $.tool.call({ tool: 'Edit', file_path: '/other/notes.ts', old_string: 'a', new_string: 'b' })
+  await $.tool.call({ tool: 'Skill', skill: 'code-review', args: 'medium /repo' })
+  await $.skill.prompt({ skill: 'code-review', text: 'Review.' })
+  await endTurn($, 't1')
+  await settle(clock)
+  expect((await bash($, 'cd /repo && git commit -am "x"')).deny ?? '').not.toContain('- Code review')
 })
 
 test('the review the gate asks for names the level the risk calls for', async ($, on) => {
@@ -289,6 +403,16 @@ test('/ship-gate pass lets one commit through', async ($, on) => {
   expect(seen.bash).toEqual(['git commit -am "x"'])
 })
 
+test('a pass is used up by the next commit even when nothing was missing', async ($, on) => {
+  const { clock, repo } = world(on)
+  await start($, clock)
+  await run($, 'pass')
+  expect((await bash($, 'git commit --allow-empty -m "x"')).deny).toBeUndefined()
+
+  repo.work['src/api.ts'] = 'export const limit = 2\n'
+  expect((await bash($, 'git commit -am "y"')).deny).toContain('Ship gate held')
+})
+
 test('a step added for a command waits until the command passes', async ($, on) => {
   const { clock, repo, files, failing } = world(on)
   repo.work['src/api.ts'] = 'export const limit = 2\n'
@@ -307,7 +431,11 @@ test('a step added for a command waits until the command passes', async ($, on) 
   await bash($, 'npm test')
   expect((await bash($, 'git commit -am "x"')).deny).toContain('- npm test passes')
 
+  // Piped, the exit code is tail's, so it doesn't count.
   failing.clear()
+  await bash($, 'npm test 2>&1 | tail -20')
+  expect((await bash($, 'git commit -am "x"')).deny).toContain('- npm test passes')
+
   await bash($, 'npm test')
   expect((await bash($, 'git commit -am "x"')).deny).toBeUndefined()
 })

@@ -1,6 +1,6 @@
 {
   "name": "ship-gate",
-  "version": "0.1.0",
+  "version": "0.1.2",
   "description": "Holds commits, pushes and pull requests until your shipping steps are done for the current code: code review, copy checks, proof sent, or any step you add.",
   "types": "./types/index.d.ts"
 }

@@ -65,6 +65,7 @@ const UI_PATHS = [
   '**/{locales,locale,i18n,translations,lang}/**',
   '**/*.strings',
 ]
+const TEST_PATHS = ['**/*.{test,spec}.*', '**/__tests__/**', '**/tests/**']
 
 const DEFAULT_STEPS: Step[] = [
   {
@@ -84,6 +85,7 @@ const DEFAULT_STEPS: Step[] = [
     flag: 'C',
     gates: ACTIONS,
     paths: UI_PATHS,
+    exclude: TEST_PATHS,
     copy: true,
     about: 'UI files',
     done: { skill: 'design:ux-copy' },
@@ -103,7 +105,7 @@ const DEFAULT_STEPS: Step[] = [
     flag: 'S',
     gates: ACTIONS,
     paths: UI_PATHS,
-    exclude: ['**/*.{test,spec}.*', '**/__tests__/**', '**/tests/**'],
+    exclude: TEST_PATHS,
     about: 'UI files',
     done: { sent: 'media' },
   },
@@ -126,12 +128,18 @@ type Config = typeof DEFAULT_CONFIG & { steps: Step[] }
 
 let currentRoot: string | undefined
 const rootOf = new Map<string, string | null>()
-// Skills that started this turn, per repository: they count for the code as it
-// stands when Claude next commits or the turn ends, so fixes made right after count.
-const pending = new Map<string, Map<string, string>>()
+// Skills that started this turn, per repository, with the code as it stood then.
+// They count for the code when Claude next commits or the turn ends, so fixes made
+// right after count, unless much more code was written after the skill ran.
+type Run = { how: string; files: Record<string, string>; lines: number }
+const pending = new Map<string, Map<string, Run>>()
+// Which repository a skill Claude called is about, from a path in its arguments.
+const skillRoots = new Map<string, string>()
 const copyOnly = new Map<string, boolean>()
 let reviewRoute: { model: string; why: string; isLogged: boolean } | undefined
 let passOnce: string | undefined
+// More than this many changed lines after a skill ran, and it covers only the code it saw.
+const FIX_LINES = 100
 let clearedAt: number | undefined
 let wasClear = false
 let queue: Promise<unknown> = Promise.resolve()
@@ -358,6 +366,21 @@ function parseDiff(text: string) {
   return { added, lines }
 }
 
+async function hashOne($: E, root: string, p: string): Promise<string> {
+  const one = await git($, root, ['hash-object', '-w', '--', p])
+  if (one.exitCode === 0 && one.stdout.trim()) return one.stdout.trim()
+  try {
+    // A submodule is its own repository: its version is the commit it's on.
+    const [top, head] = (await git($, `${root}/${p}`, ['rev-parse', '--show-toplevel', 'HEAD'])).stdout.trim().split('\n')
+    if (top === `${root}/${p}` && head) return `commit:${head}`
+  } catch {
+    // Not a submodule either.
+  }
+  return (await $.fs.exists(`${root}/${p}`)) ? 'unknown' : 'deleted'
+}
+
+const isBlob = (hash: string | undefined) => hash !== undefined && /^[0-9a-f]{7,64}$/.test(hash)
+
 const TEXTY = /\.(tsx?|jsx?|mjs|cjs|vue|svelte|html|css|scss|swift|kt|dart|json|md|mdx|strings|xml|ya?ml|txt|py|rb|go|rs|sql|toml)$/i
 
 async function survey($: E, root: string): Promise<Survey> {
@@ -381,7 +404,9 @@ async function survey($: E, root: string): Promise<Survey> {
     // -w keeps each version, so a later change can be compared with it.
     const h = await git($, root, ['hash-object', '-w', '--stdin-paths'], `${live.join('\n')}\n`)
     const hashes = h.stdout.trim().split('\n')
-    live.forEach((p, i) => (files[p] = hashes[i] || 'unknown'))
+    if (h.exitCode === 0 && hashes.length === live.length) live.forEach((p, i) => (files[p] = hashes[i]!))
+    // One path git can't hash (a submodule) stops the batch, so hash them one by one.
+    else for (const p of live) files[p] = await hashOne($, root, p)
   }
 
   const diff = await git($, root, ['diff', '-U0', '--no-color', '--no-ext-diff', '--no-renames', base])
@@ -412,10 +437,16 @@ function looksLikeCopy(s: string) {
   return (/^[A-Z]/.test(t) && /[a-z]/.test(t)) || (/\s/.test(t) && /[.!?…:]$/.test(t))
 }
 
+const isJsxLine = (line: string) => /<\/?[A-Za-z]/.test(line)
+// Text between `>` or `}` and `<` or `{` on a JSX line, without code operators in it.
+const JSX_TEXT = /[>}]([^<>{}]+)(?=[<{])/g
+const looksLikeJsxText = (s: string) => /[A-Za-z]{2}/.test(s) && /\s|^[A-Z]/.test(s.trim()) && !/&&|\|\||=>|[;()=?]/.test(s)
+
 function isCopyLine(path: string, line: string) {
   if (/(?:^|\/)(?:locales?|i18n|translations|lang)\/|\.strings$/.test(path)) return /[A-Za-z]{2}/.test(line)
   if (/^\s*(?:import\b|export \{|\/\/|\/\*|\*)/.test(line)) return false
   for (const m of line.matchAll(/>([^<>{}]+)</g)) if (looksLikeCopy(m[1]!)) return true
+  if (isJsxLine(line)) for (const m of line.matchAll(JSX_TEXT)) if (looksLikeJsxText(m[1]!)) return true
   // A line of bare JSX text, between tags on other lines.
   if (/^\s*[A-Z][^<>{}=;()[\]"'`]*[a-z][^<>{}=;()[\]"'`]*$/.test(line) && /\s/.test(line.trim())) return true
   for (const m of line.matchAll(/(["'`])((?:\\.|(?!\1).)*)\1/g)) {
@@ -426,19 +457,25 @@ function isCopyLine(path: string, line: string) {
   return false
 }
 
-const stripCopy = (line: string) =>
-  line
-    .replace(/(["'`])(?:\\.|(?!\1).)*\1/g, '$1$1')
-    .replace(/>[^<>{}]*</g, '><')
-    .trim()
+// Queries and markup in a string are code, even when they read like a sentence.
+const looksLikeCode = (s: string) => /\b(?:SELECT|INSERT|UPDATE|DELETE|WHERE|FROM|JOIN)\b|[<>{}=;$]/.test(s)
 
-// True when two versions of a file differ only inside strings and JSX text.
+// Blanks the strings and JSX text that read as copy; code strings stay, so a
+// change to one ('admin', '/api/v1') still counts as a code change.
+const stripCopy = (line: string) => {
+  const out = line.replace(/(["'`])((?:\\.|(?!\1).)*)\1/g, (m, q: string, body: string, at: number) =>
+    !NOT_COPY_KEY.test(line.slice(0, at)) && looksLikeCopy(body) && !looksLikeCode(body) ? `${q}${q}` : m,
+  )
+  return (isJsxLine(line) ? out.replace(JSX_TEXT, (m, t: string) => (looksLikeJsxText(t) ? m[0]! : m)) : out).trim()
+}
+
+// True when two versions of a file differ only in copy: strings and JSX text.
 async function isCopyOnly($: E, root: string, a: string | undefined, b: string | undefined) {
-  if (!a || !b || a === 'deleted' || b === 'deleted' || a === 'unknown' || b === 'unknown') return false
+  if (!isBlob(a) || !isBlob(b)) return false
   const key = `${a}:${b}`
   const known = copyOnly.get(key)
   if (known !== undefined) return known
-  const d = await git($, root, ['diff', '-U0', '--no-color', '--no-ext-diff', a, b])
+  const d = await git($, root, ['diff', '-U0', '--no-color', '--no-ext-diff', a!, b!])
   const minus: string[] = []
   const plus: string[] = []
   let inHunk = false
@@ -460,11 +497,11 @@ async function isCopyOnly($: E, root: string, a: string | undefined, b: string |
 
 type Verdict = { step: Step; status: StepStatus; note: string; why: string; changed: string[] }
 
-const scopedFiles = (step: Step, sv: Survey) => Object.keys(sv.files).filter(p => inScope(step, p))
+const scopedFiles = (step: Step, files: Record<string, string>) => Object.keys(files).filter(p => inScope(step, p))
 
-function snapshot(step: Step, sv: Survey) {
+function snapshot(step: Step, files: Record<string, string>) {
   const snap: Record<string, string> = {}
-  for (const p of scopedFiles(step, sv)) snap[p] = sv.files[p]!
+  for (const p of scopedFiles(step, files)) snap[p] = files[p]!
   return snap
 }
 
@@ -476,7 +513,7 @@ async function evaluate($: E, sv: Survey, steps: Step[], voyage: Voyage, now: nu
   const out: Verdict[] = []
   const running = pending.get(sv.root)
   for (const step of steps) {
-    const scoped = scopedFiles(step, sv)
+    const scoped = scopedFiles(step, sv.files)
     const about = step.about ?? 'matching files'
     let applies = scoped.length > 0
     let why = `${plural(scoped.length, 'file')} changed`
@@ -497,7 +534,7 @@ async function evaluate($: E, sv: Survey, steps: Step[], voyage: Voyage, now: nu
       continue
     }
     if (running?.has(step.id)) {
-      out.push({ step, status: 'running', note: `Running now: ${running.get(step.id)}.`, why, changed: [] })
+      out.push({ step, status: 'running', note: `Running now: ${running.get(step.id)!.how}.`, why, changed: [] })
       continue
     }
     const rec = voyage.records[step.id]
@@ -507,7 +544,8 @@ async function evaluate($: E, sv: Survey, steps: Step[], voyage: Voyage, now: nu
     }
     const changed: string[] = []
     for (const p of scoped) {
-      if (rec.snap[p] === sv.files[p]) continue
+      // A file git couldn't hash never counts as unchanged.
+      if (rec.snap[p] === sv.files[p] && sv.files[p] !== 'unknown') continue
       if (step.ignoreCopyEdits && (await isCopyOnly($, sv.root, rec.snap[p], sv.files[p]))) continue
       changed.push(p)
     }
@@ -527,11 +565,14 @@ async function finalizePending($: E, sv: Survey, steps: Step[], voyage: Voyage) 
   if (!running || running.size === 0) return voyage
   const at = await $.clock.now()
   const records = { ...voyage.records }
-  for (const [id, how] of running) {
+  for (const [id, run] of running) {
     const step = steps.find(s => s.id === id)
     if (!step) continue
-    records[id] = { at, snap: snapshot(step, sv), how }
-    await log($, 'raise', `${step.name} done (${how}).`)
+    const added = sv.lines - run.lines
+    const isFixes = added <= FIX_LINES
+    records[id] = { at, snap: snapshot(step, isFixes ? sv.files : run.files), how: run.how }
+    await log($, 'raise', `${step.name} done (${run.how}).`)
+    if (!isFixes) await log($, 'lower', `${step.name} doesn't cover the ${added} lines changed after it ran.`)
   }
   pending.delete(sv.root)
   const next = { ...voyage, records }
@@ -541,10 +582,13 @@ async function finalizePending($: E, sv: Survey, steps: Step[], voyage: Voyage) 
 
 type Look = { sv: Survey; cfg: Config; verdicts: Verdict[]; voyage: Voyage }
 
-async function look($: E, root: string): Promise<Look> {
+// A skill run stays running until the turn ends or a gated command checks it
+// (`settle`), so fixes made right after it count as covered.
+async function look($: E, root: string, settle = false): Promise<Look> {
   const cfg = await loadConfig($, root)
   const sv = await survey($, root)
-  const voyage = await finalizePending($, sv, cfg.steps, await loadVoyage($, root))
+  const saved = await loadVoyage($, root)
+  const voyage = settle ? await finalizePending($, sv, cfg.steps, saved) : saved
   const verdicts = await evaluate($, sv, cfg.steps, voyage, await $.clock.now())
   await show($, sv, verdicts)
   return { sv, cfg, verdicts, voyage }
@@ -586,7 +630,7 @@ async function show($: E, sv: Survey, verdicts: Verdict[]) {
   }))
 }
 
-async function refresh($: E, root?: string) {
+async function refresh($: E, root?: string, settle = false) {
   return serial(async () => {
     const r = root ?? currentRoot ?? (await repoRoot($, await $.session.cwd()))
     if (!r) {
@@ -594,7 +638,7 @@ async function refresh($: E, root?: string) {
       return undefined
     }
     currentRoot = r
-    return look($, r)
+    return look($, r, settle)
   })
 }
 
@@ -605,7 +649,7 @@ async function record($: E, root: string, id: string, how: string) {
     if (!step) return
     const sv = await survey($, root)
     const voyage = await loadVoyage($, root)
-    voyage.records[id] = { at: await $.clock.now(), snap: snapshot(step, sv), how }
+    voyage.records[id] = { at: await $.clock.now(), snap: snapshot(step, sv.files), how }
     await saveVoyage($, root, voyage)
     await log($, 'raise', `${step.name} done (${how}).`)
     currentRoot = root
@@ -640,6 +684,20 @@ function actionOf(text: string): Action | undefined {
   if (/^git push\b/.test(t) && !/--dry-run|--delete|\s-d\b|\s:\S/.test(t)) return 'push'
   if (/^gh pr create\b/.test(t)) return 'pr'
   return undefined
+}
+
+// Whether a command has a commit, push or pull request in it, read without the engine.
+const isGated = (command: string) =>
+  command.split(/&&|\|\||;|\||\n/).some(raw => actionOf(raw.trim().replace(/^(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)+/, '')) !== undefined)
+
+// A command step counts when its command ran whole: not filtered by extra
+// arguments, and not followed by a pipe, `||`, `;`, a new line or `&`, which
+// would hide its exit code.
+function ranWhole(seg: string, want: string, command: string) {
+  if (seg !== want && !seg.startsWith(`${want} `)) return false
+  if (!/^(?:\s*\d?>>?&?\s*\S+)*\s*$/.test(seg.slice(want.length))) return false
+  const after = command.slice(command.indexOf(seg) + seg.length)
+  return !/^[ \t]*(?:\||;|\n|&(?!&))/.test(after)
 }
 
 // ---------- review by risk ----------
@@ -692,20 +750,22 @@ function holdMessage(action: Action, sv: Survey, cfg: Config, missing: Verdict[]
       const reason = v.status === 'stale' ? `code changed since then: ${fileList(v.changed, 3)}` : v.why
       return `- ${v.step.name} (${reason}): ${instruction(v, sv, cfg)}.`
     }),
-    'Do only these steps, then run the command again. Steps already done stay done unless the code they covered changes.',
-    "Don't work around the gate. If the user wants to skip a step, they can run /ship-gate pass.",
+    "Do these steps now, then run the command again. Don't ask the user first: running them is what the gate is for. Steps already done stay done unless the code they covered changes.",
+    "Don't work around the gate or offer to skip it. Only the user can let a command through, with /ship-gate pass.",
   ]
   return lines.join('\n')
 }
 
 async function check($: E, action: Action, root: string): Promise<string | undefined> {
-  const { sv, cfg, verdicts } = await serial(() => look($, root))
+  const { sv, cfg, verdicts } = await serial(() => look($, root, true))
   currentRoot = root
   const gated = verdicts.filter(v => v.step.gates.includes(action))
   const missing = gated.filter(v => v.status === 'needed' || v.status === 'stale')
+  // A pass covers the next commit, push or pull request only, needed or not.
+  const isPassed = passOnce === root
+  if (isPassed) passOnce = undefined
   if (missing.length === 0) return undefined
-  if (passOnce === root) {
-    passOnce = undefined
+  if (isPassed) {
     await log($, 'pass', `Let one ${ACTION_WORD[action]} through without ${listWords(missing.map(v => v.step.name))}.`)
     return undefined
   }
@@ -840,9 +900,9 @@ function flagSvg(letter: string, w: number, h: number, extra = '') {
 }
 
 const PALETTE = `
-  :root { --sky:#e6eef5; --sky2:#cfdeea; --sea:#2c6a99; --sea2:#3e83b6; --foam:#f3f8fc; --hull:#1f2d3d; --boot:#c8102e; --deck:#e7d8bb; --cabin:#fbfaf6; --stone:#b8b0a1; --stone2:#9c937f; --gate:#3a4a5c; --ink:#1f2d3d; --muted:#647487; --sun:#f2b84b; --star:0; --window:#1f2d3d; --glow:0; --ok:#1d9a68; --wait:#e0a020; --held:#d7263d; }
+  :root { --sky:#e6eef5; --sky2:#cfdeea; --sea:#2c6a99; --sea2:#3e83b6; --foam:#f3f8fc; --hull:#1f2d3d; --boot:#c8102e; --deck:#e7d8bb; --cabin:#fbfaf6; --stone:#b8b0a1; --stone2:#9c937f; --gate:#3a4a5c; --ink:#1f2d3d; --muted:#647487; --sun:#f2b84b; --star:0; --window:#1f2d3d; --glow:0; --ok:#1d9a68; --wait:#e0a020; --held:#d7263d; --board:#1f2d3d; --lit-ok:#45d69b; --lit-wait:#ffc94d; --lit-held:#ff7a8a; --lit-off:#c9d4df; }
   @media (prefers-color-scheme: dark) {
-    :root { --sky:#0c1825; --sky2:#132538; --sea:#0d3657; --sea2:#174d77; --foam:#9cc2df; --hull:#3a5068; --boot:#d23a4f; --deck:#a5937a; --cabin:#d8dde3; --stone:#4b5058; --stone2:#3b4048; --gate:#8193a6; --ink:#e4ecf3; --muted:#8fa1b4; --sun:#e9e3cf; --star:.85; --window:#ffd36b; --glow:.55; --ok:#34c48a; --wait:#f0b43c; --held:#ff5468; }
+    :root { --sky:#0c1825; --sky2:#132538; --sea:#0d3657; --sea2:#174d77; --foam:#9cc2df; --hull:#3a5068; --boot:#d23a4f; --deck:#a5937a; --cabin:#d8dde3; --stone:#4b5058; --stone2:#3b4048; --gate:#8193a6; --ink:#e4ecf3; --muted:#8fa1b4; --sun:#e9e3cf; --star:.85; --window:#ffd36b; --glow:.55; --ok:#34c48a; --wait:#f0b43c; --held:#ff5468; --board:#081019; --lit-ok:#45d69b; --lit-wait:#ffc94d; --lit-held:#ff7a8a; --lit-off:#c9d4df; }
   }
   text { font-family: "Avenir Next Condensed", "Roboto Condensed", "Arial Narrow", ui-sans-serif, sans-serif; fill: var(--ink); }
   .mono { font-family: ui-monospace, "SF Mono", Menlo, monospace; }
@@ -956,6 +1016,8 @@ function harborSvg(h: Harbor, isOn: boolean, motion: Motion) {
   const blink = held
     ? `<animate attributeName="opacity" values="1;.25;1" dur=".8s" begin="${loopBegin(now, 0.8)}" repeatCount="indefinite"/>`
     : ''
+  // The sign is a lit board: bright letters on a dark plate read in both themes.
+  const signInk = !isOn ? 'var(--lit-off)' : held ? 'var(--lit-held)' : motion.isClear ? 'var(--lit-ok)' : h.changed > 0 ? 'var(--lit-wait)' : 'var(--lit-off)'
   const signText = !isOn ? 'GATE OFF' : sail ? 'BON VOYAGE' : held ? 'HELD' : h.changed === 0 ? 'MOORED' : motion.isClear ? 'CLEAR' : `${toGo} TO GO`
   const signW = Math.max(40, signText.length * 6.4 + 12)
   const gate = `<g>
@@ -972,8 +1034,8 @@ function harborSvg(h: Harbor, isOn: boolean, motion: Motion) {
     <circle cx="296" cy="62" r="4.2" style="fill:${lampColor}">${blink}</circle>
     <rect x="294.5" y="66" width="3" height="4" style="fill:var(--stone2)"/>
     <g transform="translate(${(320 - signW / 2 + 6).toFixed(1)} 38)">
-      <rect width="${signW.toFixed(1)}" height="14" rx="2" style="fill:var(--cabin);stroke:${lampColor}" stroke-width="1.2"/>
-      <text x="${(signW / 2).toFixed(1)}" y="10.3" text-anchor="middle" font-size="9.5" font-weight="700" letter-spacing="1.2" style="fill:${lampColor}">${signText}</text>
+      <rect width="${signW.toFixed(1)}" height="14" rx="2" style="fill:var(--board);stroke:${lampColor}" stroke-width="1.2"/>
+      <text x="${(signW / 2).toFixed(1)}" y="10.3" text-anchor="middle" font-size="9.5" font-weight="700" letter-spacing="1.2" style="fill:${signInk}">${signText}</text>
     </g>
   </g>`
 
@@ -1038,7 +1100,7 @@ function harborSvg(h: Harbor, isOn: boolean, motion: Motion) {
 
 const STATUS_WORD: Record<StepStatus, { text: string; color: string }> = {
   done: { text: 'Done', color: 'success' },
-  stale: { text: 'Out of date', color: 'warning' },
+  stale: { text: 'Out of date', color: 'text' },
   needed: { text: 'Needed', color: 'error' },
   running: { text: 'Running', color: 'claude' },
   skipped: { text: 'Not needed', color: 'subtle' },
@@ -1046,11 +1108,11 @@ const STATUS_WORD: Record<StepStatus, { text: string; color: string }> = {
 
 const LOG_MARK: Record<LogEntry['kind'], { mark: string; color: string }> = {
   raise: { mark: '▲', color: 'success' },
-  lower: { mark: '▼', color: 'warning' },
+  lower: { mark: '▼', color: 'text' },
   hold: { mark: '■', color: 'error' },
   sail: { mark: '➜', color: 'success' },
   route: { mark: '↳', color: 'suggestion' },
-  guard: { mark: '✕', color: 'warning' },
+  guard: { mark: '✕', color: 'error' },
   pass: { mark: '○', color: 'subtle' },
 }
 
@@ -1074,7 +1136,7 @@ export const register: Register = on => {
     const done = await next(e)
     if (e.agentId === undefined) {
       reviewRoute = undefined
-      void refresh($).catch(() => undefined)
+      void refresh($, undefined, true).catch(() => undefined)
     }
     return done
   })
@@ -1099,14 +1161,18 @@ export const register: Register = on => {
   on('skill.prompt', async ($, e, next) => {
     const out = await next(e)
     if (!(await read($, onAtom))) return out
-    const root = currentRoot ?? (await repoRoot($, await $.session.cwd()))
+    const named = skillRoots.get(e.skill)
+    skillRoots.delete(e.skill)
+    const root = named ?? currentRoot ?? (await repoRoot($, await $.session.cwd()))
     if (!root) return out
     const cfg = await loadConfig($, root)
     const hits = cfg.steps.filter(s => skillsOf(s.done).some(want => skillMatches(want, e.skill)))
     if (hits.length === 0) return out
     const level = e.text.match(LEVEL)?.[1]
-    const map = pending.get(root) ?? new Map<string, string>()
-    for (const s of hits) map.set(s.id, `/${e.skill}${level && skillTail(e.skill) === 'code-review' ? ` ${level}` : ''}`)
+    const how = `/${e.skill}${level && skillTail(e.skill) === 'code-review' ? ` ${level}` : ''}`
+    const sv = await serial(() => survey($, root))
+    const map = pending.get(root) ?? new Map<string, Run>()
+    for (const s of hits) map.set(s.id, { how, files: sv.files, lines: sv.lines })
     pending.set(root, map)
     currentRoot = root
     void refresh($, root).catch(() => undefined)
@@ -1115,8 +1181,14 @@ export const register: Register = on => {
 
   // Claude's own code review: the level and reviewer model follow the risk.
   on('tool.call', { tool: 'Skill' }, async ($, e, next) => {
-    if (!(await read($, onAtom)) || e.agentId !== undefined || skillTail(e.skill) !== 'code-review') return next(e)
-    const root = currentRoot ?? (await repoRoot($, await $.session.cwd()))
+    if (!(await read($, onAtom))) return next(e)
+    // A path in the arguments says which repository the skill is about.
+    const path = (e.args ?? '').match(/(?:^|\s)((?:~|\/)[^\s`'"]+)/)?.[1]
+    const full = path ? resolvePath('/', path, await home($)) : undefined
+    const named = full ? ((await repoRoot($, full)) ?? (await repoRoot($, full.replace(/\/[^/]*$/, '') || '/'))) : undefined
+    if (named) skillRoots.set(e.skill, named)
+    if (e.agentId !== undefined || skillTail(e.skill) !== 'code-review') return next(e)
+    const root = named ?? currentRoot ?? (await repoRoot($, await $.session.cwd()))
     if (!root) return next(e)
     const cfg = await loadConfig($, root)
     const sv = await survey($, root)
@@ -1130,6 +1202,8 @@ export const register: Register = on => {
 
   on('agent.spawn', async ($, e, next) => {
     if (!reviewRoute || e.fork || e.isTeammate || e.resume) return next(e)
+    // Only the review's own agents follow the risk; others keep their model.
+    if (!/review|verif|finder|angle/i.test(`${e.description} ${e.prompt.slice(0, 400)}`)) return next(e)
     if (!reviewRoute.isLogged) {
       reviewRoute.isLogged = true
       await log($, 'route', `Review agents run on ${reviewRoute.model.replace(/^claude-/, '').replace(/-(\d)-(\d)$/, ' $1.$2').replace(/^\w/, c => c.toUpperCase())}.`)
@@ -1192,7 +1266,7 @@ export const register: Register = on => {
           if (!root) continue
           const cfg = await loadConfig($, root)
           for (const s of cfg.steps) {
-            if ('command' in s.done && seg.text.includes(s.done.command)) await record($, root, s.id, `\`${s.done.command}\` passed`)
+            if ('command' in s.done && ranWhole(seg.text, s.done.command, e.command)) await record($, root, s.id, `\`${s.done.command}\` passed`)
           }
         }
       }
@@ -1223,7 +1297,12 @@ export const register: Register = on => {
       if (acted.length > 0) void refresh($, acted[acted.length - 1]!.root).catch(() => undefined)
     }
     return ran
-  }).catch(($, e, next) => next(e))
+  }).catch(($, e, next) =>
+    // A gate that fails holds what it gates; any other command runs.
+    next.called || !isGated(e.command)
+      ? next(e)
+      : { deny: "Ship gate couldn't check this command, so it held it. Run it again. If it's held again, tell the user: they can run /ship-gate off to go ahead without the gate." },
+  )
 
   on('command.run', { command: 'ship-gate' }, async ($, e) => {
     const args = (e.args ?? '').trim()
@@ -1324,7 +1403,7 @@ export const register: Register = on => {
               ? ['No changes yet. Commits, pushes and pull requests wait here until every step is done.', 'subtle']
               : isClear
                 ? ['Clear to ship. Every step is done for this code.', 'success']
-                : [`${plural(left.length, 'step')} before shipping: ${listWords(left.map(s => s.name))}.`, 'warning']
+                : [`${plural(left.length, 'step')} before shipping: ${listWords(left.map(s => s.name))}.`, 'text']
 
     const alt = [headline, ...live.map(s => `${s.name}: ${STATUS_WORD[s.status].text}`)].join(' ')
 
@@ -1400,16 +1479,14 @@ export const register: Register = on => {
           <Box key="help-onoff" flexDirection="column" flexShrink={1} minWidth={18}>
             <Button
               key="onoff"
-              label={isOn ? 'Gate: On' : 'Gate: Off'}
+              label={isOn ? '● Gate: On' : '○ Gate: Off'}
               dimColor={!isOn}
               onPress={async () => {
                 const next = !isOn
                 await update($, onAtom, () => next)
                 await $.store.set('enabled', next)
               }}
-            >
-              <Text color={isOn ? 'success' : 'subtle'}>{isOn ? '●' : '○'}</Text> Gate: {isOn ? 'On' : 'Off'}
-            </Button>
+            />
             <Text dimColor size="footnote">When it's off, nothing is checked or blocked.</Text>
           </Box>
         </Box>
