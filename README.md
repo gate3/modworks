@@ -10,23 +10,23 @@ A collection of mods for Claude Code. Each mod lives in its own folder under `pl
 
 ## Install a mod
 
-At the prompt of a Claude Code terminal session:
-
-```
-/plugin install cost-guard --marketplace gate3/modworks
-```
-
-Answer `y` to add the marketplace, then pick a scope. User scope loads the mod in every session.
-
-From a shell:
+From a shell, add this repo as a marketplace once, then install the mod:
 
 ```bash
-claude plugin install cost-guard --marketplace gate3/modworks
+claude plugin marketplace add gate3/modworks
 ```
+
+```bash
+claude plugin install cost-guard@modworks
+```
+
+It installs at user scope, so it loads in every new session.
+
+At the prompt of a Claude Code terminal session, the same two steps are `/plugin marketplace add gate3/modworks` and `/plugin install cost-guard@modworks`.
 
 In the desktop app: click **+** next to the prompt box, then **Plugins** > **Add marketplace**, enter `gate3/modworks`, then **Add plugin**.
 
-To install a different mod, swap `cost-guard` for that mod's name.
+To install a different mod, swap `cost-guard` for that mod's name. To get the latest version later, run `claude plugin marketplace update modworks`, then `claude plugin update cost-guard@modworks`.
 
 ## Repository layout
 

@@ -20,6 +20,10 @@ Handoff notes are saved to `~/.claude/cost-guard/handoffs/`.
 
 ## Install
 
+```bash
+claude plugin marketplace add gate3/modworks
 ```
-/plugin install cost-guard --marketplace gate3/modworks
+
+```bash
+claude plugin install cost-guard@modworks
 ```
