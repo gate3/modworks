@@ -9,6 +9,11 @@
       "name": "cost-guard",
       "source": "./plugins/cost-guard",
       "description": "Helps long Claude Code sessions use less of your usage limits: a live usage and context pane, automatic compaction at a threshold you pick (your history stays on screen), and trimmed tool output."
+    },
+    {
+      "name": "ship-gate",
+      "source": "./plugins/ship-gate",
+      "description": "Holds Claude's commits, pushes and pull requests until your shipping steps are done for the current code: code review, UX and marketing copy checks, a screenshot or video sent, or steps you add."
     }
   ]
 }

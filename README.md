@@ -7,6 +7,7 @@ A collection of mods for Claude Code. Each mod lives in its own folder under `pl
 | Mod | What it does |
 | --- | --- |
 | [cost-guard](plugins/cost-guard) | A side pane that shows your usage limits and how full the context is. At a threshold you pick, it compacts the conversation, and your earlier messages stay on screen. It also trims long tool output. |
+| [ship-gate](plugins/ship-gate) | Holds Claude's commits, pushes and pull requests until your steps are done for the current code: code review, copy checks, a screenshot or video, or any step you add. A harbor pane shows each step as a signal flag. |
 
 ## Install a mod
 
