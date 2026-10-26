@@ -75,19 +75,18 @@ test('the pane shows usage and context on every surface', async ($, on) => {
   }
 })
 
-test('every button has a tip that its hover reveals', async ($, on) => {
+test('every control says what it does without hovering', async ($, on) => {
   world(on)
   await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
   await measure($, 142_000)
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
 
-  for (const id of ['handoff-now', 'autoHandoff', 'idleHandoff', 'trimOutput', 'cheapSubagents']) {
-    expect(await ui.find({ key: `tip-${id}` })).toBeDefined()
-    expect(await ui.find({ key: `tip-card-${id}` })).toBeDefined()
+  for (const id of ['handoff-now', 'autoHandoff', 'idleHandoff', 'trimOutput', 'cheapSubagents', 'threshold']) {
+    expect(await ui.find({ key: `help-${id}` })).toBeDefined()
   }
-  expect(await ui.find({ type: 'Text', text: /At 200K tokens, summarizes the conversation/ })).toBeDefined()
-  expect(await ui.find({ type: 'Text', text: /Point at a button/ })).toBeDefined()
-  expect(await ui.find({ key: 'tip-threshold' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /Compacts at 200K so long sessions use less of your limit/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /Earlier messages stay on screen/ })).toBeDefined()
+  expect(JSON.stringify(await ui.drawn())).not.toContain('"display":"none"')
   await ui.unmount()
 })
 

@@ -795,43 +795,25 @@ export const register: Register = on => {
     const thresholds = [...new Set([...THRESHOLDS, s.handoffAt])].sort((a, b) => a - b)
     const isFresh = handoffMark !== undefined && now - handoffMark.at < 60_000
 
-    const tips: Record<string, { title: string; body: string }> = {
-      'handoff-now': {
-        title: 'Compact now',
-        body: 'Summarizes the conversation to free up context. Earlier messages stay on screen. Best between tasks.',
-      },
-      threshold: {
-        title: `Compact at ${tokens(s.handoffAt)}`,
-        body: 'Lower resends less history with each message; higher keeps more in one context. Takes effect after Claude’s next reply. Other values: /cost-guard threshold 250k',
-      },
-      autoHandoff: {
-        title: `Auto compact · ${s.autoHandoff ? 'On' : 'Off'}`,
-        body: `At ${tokens(s.handoffAt)} tokens, summarizes the conversation so long sessions use less of your limit. Earlier messages stay on screen.`,
-      },
-      idleHandoff: {
-        title: `Idle compact · ${s.idleHandoff ? 'On' : 'Off'}`,
-        body: 'After 50 minutes away, compacts before the cache expires, so your next message doesn’t reprocess the whole conversation.',
-      },
-      trimOutput: {
-        title: `Trim output · ${s.trimOutput ? 'On' : 'Off'}`,
-        body: `Shortens command output over ${tokens(s.trimAt)} characters to its start and end. The full output is saved to a file Claude can read.`,
-      },
-      cheapSubagents: {
-        title: `Cheaper subagents · ${s.cheapSubagents ? 'On' : 'Off'}`,
-        body: 'Runs Explore subagents on Sonnet 5.5 to save usage. Your main conversation keeps its model and its cache.',
-      },
+    // What each control does, drawn under it: hover isn't reliable on every surface.
+    const help: Record<string, string> = {
+      'handoff-now': 'Summarizes the conversation to free up context. Earlier messages stay on screen.',
+      autoHandoff: `Compacts at ${tokens(s.handoffAt)} so long sessions use less of your limit.`,
+      idleHandoff: 'After 50 minutes away, compacts before the cache expires.',
+      trimOutput: `Shortens command output over ${tokens(s.trimAt)} characters. Claude can still read the full output.`,
+      cheapSubagents: 'Runs Explore subagents on Sonnet 5.5. Your conversation keeps its model.',
+      threshold: 'Lower uses less of your limit; higher keeps more in context. For another value, run /cost-guard threshold 250k',
     }
 
-    // Each button lights a hover group; its tip in the slot below joins the
-    // same group, so pointing at a button reveals what it does.
-    const withTip = (id: string, button: ReturnType<typeof Button>) => (
-      <Box key={`tip-${id}`} hover={{ scope: `tip-${id}` }}>
+    const withHelp = (id: string, button: ReturnType<typeof Button>) => (
+      <Box key={`help-${id}`} flexDirection="column">
         {button}
+        <Text dimColor size="footnote">{help[id]}</Text>
       </Box>
     )
 
     const toggle = (key: keyof GuardSettings, label: string, value: boolean) =>
-      withTip(
+      withHelp(
         key,
         <Button
           key={key}
@@ -893,42 +875,34 @@ export const register: Register = on => {
           {headline}
         </Text>
 
-        <Box flexDirection="column">
-          <Box flexDirection="row" flexWrap="wrap" gap={1}>
-            {withTip(
-              'handoff-now',
-              <Button key="handoff-now" variant="primary" onPress={() => void handOff($, 'manual')}>
-                Compact now
-              </Button>,
-            )}
-            {toggle('autoHandoff', 'Auto compact', s.autoHandoff)}
-            {toggle('idleHandoff', 'Idle compact', s.idleHandoff)}
-            {toggle('trimOutput', 'Trim output', s.trimOutput)}
-            {toggle('cheapSubagents', 'Cheaper subagents', s.cheapSubagents)}
-          </Box>
-          <Box key="tip-threshold" hover={{ scope: 'tip-threshold' }} flexDirection="row" flexWrap="wrap" alignItems="center" gap={1} marginTop={1}>
-            <Text dimColor>Compact at</Text>
-            {thresholds.map(value => (
-              <Button
-                key={`threshold-${value}`}
-                label={value === s.handoffAt ? `✓ ${tokens(value)}` : tokens(value)}
-                variant={value === s.handoffAt ? 'primary' : undefined}
-                dimColor={value !== s.handoffAt}
-                onPress={async () => {
-                  await saveSettings($, { handoffAt: value })
-                  await refreshStatus($)
-                }}
-              />
-            ))}
-          </Box>
-          <Box flexDirection="column" height={4} overflow="hidden" marginTop={1}>
-            {Object.entries(tips).map(([id, tip]) => (
-              <Box key={`tip-card-${id}`} flexDirection="column" display="none" hover={{ scope: `tip-${id}`, display: 'flex' }}>
-                <Text weight="semibold" size="footnote">{tip.title}</Text>
-                <Text dimColor size="footnote">{tip.body}</Text>
-              </Box>
-            ))}
-            <Text dimColor size="footnote">Point at a button to see what it does.</Text>
+        <Box flexDirection="column" gap={1}>
+          {withHelp(
+            'handoff-now',
+            <Button key="handoff-now" variant="primary" onPress={() => void handOff($, 'manual')}>
+              Compact now
+            </Button>,
+          )}
+          {toggle('autoHandoff', 'Auto compact', s.autoHandoff)}
+          {toggle('idleHandoff', 'Idle compact', s.idleHandoff)}
+          {toggle('trimOutput', 'Trim output', s.trimOutput)}
+          {toggle('cheapSubagents', 'Cheaper subagents', s.cheapSubagents)}
+          <Box key="help-threshold" flexDirection="column">
+            <Box flexDirection="row" flexWrap="wrap" alignItems="center" gap={1}>
+              <Text dimColor>Compact at</Text>
+              {thresholds.map(value => (
+                <Button
+                  key={`threshold-${value}`}
+                  label={value === s.handoffAt ? `✓ ${tokens(value)}` : tokens(value)}
+                  variant={value === s.handoffAt ? 'primary' : undefined}
+                  dimColor={value !== s.handoffAt}
+                  onPress={async () => {
+                    await saveSettings($, { handoffAt: value })
+                    await refreshStatus($)
+                  }}
+                />
+              ))}
+            </Box>
+            <Text dimColor size="footnote">{help.threshold}</Text>
           </Box>
         </Box>
 
