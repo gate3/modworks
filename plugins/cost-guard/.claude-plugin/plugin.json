@@ -1,6 +1,6 @@
 {
   "name": "cost-guard",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Cuts Claude Code session cost: live cost and cache meter, automatic compaction at a token threshold, trimmed tool output and cheaper exploration subagents.",
   "types": "./types/index.d.ts"
 }

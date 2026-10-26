@@ -55,6 +55,10 @@ let lastFive = 0
 let limitBump: { at: number; points: number } | undefined
 let hitAt: number | undefined
 let handoffMark: { at: number; freed: number } | undefined
+// Where $.session.compact isn't available (the desktop app and other SDK hosts),
+// the /compact command does it instead; the session.compact hook reports how it went.
+let compactsByPrompt = false
+let queuedCompact: { at: number; before: number; why: HandoffReason } | undefined
 const agentTypes = new Map<string, string>()
 const routedAgents = new Set<string>()
 
@@ -159,33 +163,63 @@ const KEEP = `Keep enough that you can carry on exactly where you are without th
 - facts not to re-derive: commands, ids, URLs, test results
 Leave out secrets and credentials.`
 
-async function handOff($: E, why: 'threshold' | 'idle' | 'manual') {
+type HandoffReason = 'threshold' | 'idle' | 'manual'
+
+async function compacted($: E, before: number, after: number | undefined, why: HandoffReason) {
+  await update($, phaseAtom, (): Phase => ({ kind: 'clearing', since: Date.now() }))
+  expectsFreshPrefix = true
+  freedFrom = before
+  // The next measure fills in the real size when the engine didn't count it.
+  await update($, meterAtom, m => ({ ...m, tokens: after ?? 0, handoffs: m.handoffs + 1 }))
+  handoffMark = { at: await $.clock.now(), freed: before - (after ?? 0) }
+  const label = why === 'idle' ? 'before the cache expired' : why === 'manual' ? 'on request' : `at ${tokens(before)}`
+  await remember($, 'handoff', `Compacted ${label}.`)
+  $.ui.toast(`Compacted ${label}. Earlier messages stay on screen.`)
+}
+
+// Resolves true while the compaction is still to come, false once it ran.
+async function compactByCommand($: E, before: number, why: HandoffReason) {
+  queuedCompact = { at: await $.clock.now(), before, why }
+  try {
+    await $.command.run({ command: 'compact' })
+  } catch (err) {
+    queuedCompact = undefined
+    throw err
+  }
+  return queuedCompact !== undefined
+}
+
+async function handOff($: E, why: HandoffReason) {
   if (isBusy || isTurnRunning) return
+  // A /compact that never ran stops blocking after 10 minutes.
+  if (queuedCompact !== undefined && (await $.clock.now()) - queuedCompact.at < 10 * 60_000) return
   isBusy = true
+  let isQueued = false
   try {
     const before = (await read($, meterAtom)).tokens
     await update($, phaseAtom, (): Phase => ({ kind: 'writing', since: Date.now() }))
 
-    const done = await $.session.compact({ instructions: KEEP })
-    if (done.skip !== undefined) {
-      await remember($, 'skip', `Compact skipped: ${done.skip}. Tries again after Claude’s next reply.`)
-      return
+    if (!compactsByPrompt) {
+      try {
+        const done = await $.session.compact({ instructions: KEEP })
+        if (done.skip !== undefined) {
+          await remember($, 'skip', `Compact skipped: ${done.skip}. Tries again after Claude’s next reply.`)
+          return
+        }
+        await compacted($, before, done.tokensAfter, why)
+        return
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err)
+        if (!/not available|headless/i.test(message)) throw err
+        compactsByPrompt = true
+      }
     }
-
-    await update($, phaseAtom, (): Phase => ({ kind: 'clearing', since: Date.now() }))
-    expectsFreshPrefix = true
-    freedFrom = before
-    // The next measure fills in the real size when the engine didn't count it.
-    await update($, meterAtom, m => ({ ...m, tokens: done.tokensAfter ?? 0, handoffs: m.handoffs + 1 }))
-
-    handoffMark = { at: await $.clock.now(), freed: before - (done.tokensAfter ?? 0) }
-    const label = why === 'idle' ? 'before the cache expired' : why === 'manual' ? 'on request' : `at ${tokens(before)}`
-    await remember($, 'handoff', `Compacted ${label}.`)
-    $.ui.toast(`Compacted ${label}. Earlier messages stay on screen.`)
+    isQueued = await compactByCommand($, before, why)
   } catch (err) {
     await remember($, 'skip', `Compact failed: ${err instanceof Error ? err.message : String(err)}. Tries again after Claude’s next reply.`)
   } finally {
-    await update($, phaseAtom, (): Phase => ({ kind: 'idle' }))
+    // A /compact still to run keeps the pane on "Compacting…"; the hook settles it.
+    if (!isQueued) await update($, phaseAtom, (): Phase => ({ kind: 'idle' }))
     isBusy = false
   }
 }
@@ -713,11 +747,26 @@ export const register: Register = on => {
     return r
   })
 
-  on('session.compact', ($, e, next) => {
+  on('session.compact', async ($, e, next) => {
     const keep =
       'Keep: the goal, the current plan and next steps, decisions and the user\'s stated preferences, every file touched with its absolute path, open questions, scheduled loops, and exact commands, ids and test results.'
     expectsFreshPrefix = true
-    return next({ ...e, instructions: e.instructions ? `${e.instructions}\n\n${keep}` : keep })
+    const queued = e.agentId === undefined && e.trigger === 'manual' ? queuedCompact : undefined
+    if (queued === undefined) return next({ ...e, instructions: e.instructions ? `${e.instructions}\n\n${keep}` : keep })
+
+    // Cost guard's own /compact: the full instructions, and the pane told how it went.
+    queuedCompact = undefined
+    const done = await next({ ...e, instructions: KEEP })
+    // Never throws: a throw here would make the catch below compact a second time.
+    try {
+      if (done.skip !== undefined) await remember($, 'skip', `Compact skipped: ${done.skip}. Tries again after Claude’s next reply.`)
+      else await compacted($, queued.before, done.tokensAfter, queued.why)
+    } catch {
+      // The compaction stood; only the pane's report of it failed.
+    } finally {
+      await update($, phaseAtom, (): Phase => ({ kind: 'idle' }))
+    }
+    return done
   }).catch(($, e, next) => next(e))
 
   on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
