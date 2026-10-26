@@ -55,10 +55,6 @@ let lastFive = 0
 let limitBump: { at: number; points: number } | undefined
 let hitAt: number | undefined
 let handoffMark: { at: number; freed: number } | undefined
-// Counts the main agent's turns, so a handoff can tell a message came in while it wrote the note.
-let turnsStarted = 0
-// The resume prompt waiting to run after a clear. A message the person sends first carries it instead.
-let pendingResume: { prompt: string; context: string } | undefined
 const agentTypes = new Map<string, string>()
 const routedAgents = new Set<string>()
 
@@ -151,90 +147,43 @@ async function refreshStatus($: E) {
 
 // ---------- handoff ----------
 
-const NOTE_PROMPT = `Write a handoff note so a fresh session with no memory of this conversation can carry on exactly where you are. A plugin will clear this conversation to save cost and give the note to the new session. Reply with the note only, in this shape:
-
-STATUS: <one of IN_PROGRESS, WAITING_FOR_USER, DONE>
-(IN_PROGRESS: you were mid-work and would carry on without the user. WAITING_FOR_USER: your last message asked the user something or needs their decision or approval. DONE: the task is finished.)
-
-## Goal
-## Where things stand
-## Decisions, constraints and the user's stated preferences
-## Files touched (absolute paths, and what changed)
-## Next steps
-## Open question for the user (the exact question, or "none")
-## Scheduled loops or check-ins (exact prompt and schedule, or "none")
-## Facts not to re-derive (commands, ids, URLs, test results)
-
-Be specific and complete, but under 1,500 words. Leave out secrets and credentials.`
-
-function resumePrompt(note: string, path: string, before: number) {
-  return `[cost-guard handoff] The conversation reached ${tokens(before)} tokens, so cost-guard cleared it to cut cost. The previous session wrote this handoff note (also saved at ${path}):
-
-<handoff-note>
-${note}
-</handoff-note>
-
-Carry on from the note:
-- STATUS IN_PROGRESS: continue with the next steps now.
-- STATUS WAITING_FOR_USER: restate the open question in one or two sentences, then stop.
-- STATUS DONE: say in one line where things stand, then stop.
-If the note lists scheduled loops or check-ins, check CronList and recreate only the ones that are missing. Read files again before editing them.`
-}
-
-// For when the person's message reaches the fresh context before the resume prompt does.
-function resumeContext(note: string, path: string, before: number) {
-  return `[cost-guard handoff] The conversation reached ${tokens(before)} tokens, so cost-guard cleared it to cut cost. The previous session wrote this handoff note (also saved at ${path}):
-
-<handoff-note>
-${note}
-</handoff-note>
-
-The user's message above came in right after the handoff. Answer it, using the note for context. If the note's status is IN_PROGRESS and the message doesn't change the plan, carry on with the note's next steps afterward. If the note lists scheduled loops or check-ins, check CronList and recreate only the ones that are missing. Read files again before editing them.`
-}
+// Compacting, not clearing, keeps the earlier messages on screen for the person
+// while the model carries on from the summary.
+const KEEP = `Keep enough that you can carry on exactly where you are without the earlier messages:
+- STATUS: IN_PROGRESS (mid-work), WAITING_FOR_USER (your last message asked something or needs a decision or approval) or DONE
+- the goal, where things stand, and the next steps
+- decisions, constraints and the user's stated preferences
+- every file touched, with its absolute path and what changed
+- the open question for the user, word for word, or "none"
+- scheduled loops or check-ins, with their exact prompt and schedule
+- facts not to re-derive: commands, ids, URLs, test results
+Leave out secrets and credentials.`
 
 async function handOff($: E, why: 'threshold' | 'idle' | 'manual') {
-  if (isBusy) return
+  if (isBusy || isTurnRunning) return
   isBusy = true
-  const turnsAtStart = turnsStarted
   try {
     const before = (await read($, meterAtom)).tokens
     await update($, phaseAtom, (): Phase => ({ kind: 'writing', since: Date.now() }))
 
-    const fork = await $.model.fork({ prompt: NOTE_PROMPT })
-    if (!fork.isAnswered) {
-      await remember($, 'skip', `Handoff skipped: couldn't write the note (${fork.reason}). Tries again after the next turn.`)
-      return
-    }
-    const note = fork.text.trim()
-
-    const dir = `${await home($)}/.claude/cost-guard/handoffs`
-    const path = `${dir}/${await stamp($)}.md`
-    await $.fs.write(path, note)
-
-    // Clearing now would drop the message the person just sent from its own context.
-    if (isTurnRunning || turnsStarted !== turnsAtStart) {
-      await remember($, 'skip', 'Handoff skipped: you sent a message while the note was being written. Tries again after the next turn.')
+    const done = await $.session.compact({ instructions: KEEP })
+    if (done.skip !== undefined) {
+      await remember($, 'skip', `Compact skipped: ${done.skip}. Tries again after Claude’s next reply.`)
       return
     }
 
     await update($, phaseAtom, (): Phase => ({ kind: 'clearing', since: Date.now() }))
-    await $.command.run({ command: 'clear' })
-    await loadSettings($)
     expectsFreshPrefix = true
     freedFrom = before
-    // The context is empty now; the next measure fills in the real size.
-    await update($, meterAtom, m => ({ ...m, tokens: 0 }))
-    pendingResume = { prompt: resumePrompt(note, path, before), context: resumeContext(note, path, before) }
-    // Runs once the session is idle; the prompt.submit hook hands it to an earlier message instead.
-    void $.prompt.submit({ text: pendingResume.prompt })
+    // The next measure fills in the real size when the engine didn't count it.
+    await update($, meterAtom, m => ({ ...m, tokens: done.tokensAfter ?? 0, handoffs: m.handoffs + 1 }))
 
-    await update($, meterAtom, m => ({ ...m, handoffs: m.handoffs + 1 }))
-    handoffMark = { at: await $.clock.now(), freed: before }
+    handoffMark = { at: await $.clock.now(), freed: before - (done.tokensAfter ?? 0) }
     const label = why === 'idle' ? 'before the cache expired' : why === 'manual' ? 'on request' : `at ${tokens(before)}`
-    await remember($, 'handoff', `Handed off ${label}. Started a fresh context.`)
-    $.ui.toast(`Handed off ${label}. Continuing in a fresh context.`)
+    await remember($, 'handoff', `Compacted ${label}.`)
+    $.ui.toast(`Compacted ${label}. Earlier messages stay on screen.`)
   } catch (err) {
-    await remember($, 'skip', `Handoff failed: ${err instanceof Error ? err.message : String(err)}`)
+    await remember($, 'skip', `Compact failed: ${err instanceof Error ? err.message : String(err)}. Tries again after Claude’s next reply.`)
   } finally {
     await update($, phaseAtom, (): Phase => ({ kind: 'idle' }))
     isBusy = false
@@ -316,7 +265,7 @@ const FALL = 'calcMode="spline" keyTimes="0;1" keySplines=".5 0 .9 .6"'
 
 // The context as a load on a small creature's back: each box is a slice of
 // the conversation, the tower wobbles and the critter tires as it grows, and
-// a handoff drops the load for a single envelope.
+// a compaction drops the load for a single envelope.
 function critter(m: Meter, limit: number, phase: Phase, motion: Motion) {
   const { now } = motion
   const raw = limit > 0 ? m.tokens / limit : 0
@@ -419,12 +368,12 @@ function critter(m: Meter, limit: number, phase: Phase, motion: Motion) {
 
   const label =
     phase.kind === 'writing'
-      ? `<tspan font-weight="600">Writing note…</tspan>`
+      ? `<tspan font-weight="600">Compacting…</tspan>`
       : isClearing
-        ? `<tspan font-weight="600">Clearing…</tspan>`
+        ? `<tspan font-weight="600">Compacted</tspan>`
         : `<tspan font-weight="600">${tokens(m.tokens)}</tspan><tspan class="muted"> of ${tokens(limit)}</tspan>`
 
-  const tip = `Context: ${tokens(m.tokens)} of ${tokens(limit)} tokens. Each box is part of the conversation. At ${tokens(limit)}, Cost guard hands off to a fresh context and drops the load.`
+  const tip = `Context: ${tokens(m.tokens)} of ${tokens(limit)} tokens. Each box is part of the conversation. At ${tokens(limit)}, Cost guard compacts the conversation and drops the load.`
 
   return `<g>
     <title>${esc(tip)}</title>
@@ -640,7 +589,7 @@ export const register: Register = on => {
     // A meter saved by an older version has no limits yet.
     await update($, meterAtom, m => (m.limits ? m : { ...m, limits: [] }))
     await $.command.register({ name: 'cost-guard', description: 'Open the cost guard pane, or: on, off, status, threshold <tokens>' })
-    await $.command.register({ name: 'handoff', description: 'Save a handoff note, clear the conversation and carry on in a fresh context' })
+    await $.command.register({ name: 'handoff', description: 'Compact the conversation now. Earlier messages stay on screen.' })
     $.clock.every(30_000, () => void idleCheck($))
     void $.ui.open({ id: PANE, title: TITLE })
     return next(e)
@@ -681,24 +630,9 @@ export const register: Register = on => {
     return next(e)
   }).catch(($, e, next) => next(e))
 
-  on('prompt.submit', async ($, e, next) => {
-    const isResume = e.origin?.kind === 'plugin' && e.origin.name === 'cost-guard' && e.text.startsWith('[cost-guard handoff]')
-    if (isResume) {
-      // The note already went with the person's message.
-      if (pendingResume === undefined) return { drop: 'The handoff note already went with your message.' }
-      pendingResume = undefined
-      return next(e)
-    }
-    if (pendingResume === undefined || e.command !== undefined || e.isMeta) return next(e)
-    const { context } = pendingResume
-    pendingResume = undefined
-    return next({ ...e, context: [...(e.context ?? []), context] })
-  })
-
   on('turn.start', async ($, e, next) => {
     if (e.agentId === undefined) {
       await loadSettings($)
-      turnsStarted += 1
       isTurnRunning = true
       await update($, runningAtom, () => true)
     }
@@ -807,9 +741,9 @@ export const register: Register = on => {
   }).catch(($, e, next) => next(e))
 
   on('command.run', { command: 'handoff' }, async $ => {
-    if (isBusy) return { text: 'A handoff is already running.' }
+    if (isBusy) return { text: 'Already compacting.' }
     $.clock.after(200, () => void handOff($, 'manual'))
-    return { text: 'Writing a handoff note. Then the conversation clears and continues in a fresh context.' }
+    return { text: 'Compacting the conversation. Earlier messages stay on screen.' }
   })
 
   on('command.run', { command: 'cost-guard' }, async ($, e) => {
@@ -817,25 +751,25 @@ export const register: Register = on => {
     if (word === 'on' || word === 'off') {
       await saveSettings($, { autoHandoff: word === 'on' })
       await refreshStatus($)
-      return { text: `Auto handoff is ${word}.` }
+      return { text: `Auto compact is ${word}.` }
     }
     if (word === 'threshold') {
       const n = Number((value ?? '').replace(/k$/, '000').replace(/m$/, '000000'))
       if (!Number.isFinite(n) || n < 50_000) return { text: 'Use at least 50K tokens, for example /cost-guard threshold 150k.' }
       await saveSettings($, { handoffAt: Math.round(n) })
       await refreshStatus($)
-      return { text: `Auto handoff now runs at ${tokens(n)} tokens.` }
+      return { text: `Auto compact now runs at ${tokens(n)} tokens.` }
     }
     if (word === 'status') {
       const s = await read($, settingsAtom)
       const m = await read($, meterAtom)
       return {
         text: [
-          `Auto handoff: ${s.autoHandoff ? `on, at ${tokens(s.handoffAt)} tokens` : 'off'}`,
-          `Idle handoff: ${s.idleHandoff ? `on, when idle with ${tokens(s.idleHandoffAt)}+ tokens` : 'off'}`,
+          `Auto compact: ${s.autoHandoff ? `on, at ${tokens(s.handoffAt)} tokens` : 'off'}`,
+          `Idle compact: ${s.idleHandoff ? `on, when idle with ${tokens(s.idleHandoffAt)}+ tokens` : 'off'}`,
           `Trim output: ${s.trimOutput ? `on, Bash output over ${s.trimAt.toLocaleString('en-US')} characters` : 'off'}`,
           `Cheaper subagents: ${s.cheapSubagents ? 'on' : 'off'}`,
-          `Context: ${tokens(m.tokens)} · cache ${hitRate(m.hits) ?? '—'}% · ${m.handoffs} handoffs`,
+          `Context: ${tokens(m.tokens)} · cache ${hitRate(m.hits) ?? '—'}% · ${m.handoffs} compactions`,
         ].join('\n'),
       }
     }
@@ -863,20 +797,20 @@ export const register: Register = on => {
 
     const tips: Record<string, { title: string; body: string }> = {
       'handoff-now': {
-        title: 'Hand off now',
-        body: 'Saves a handoff note, clears the conversation and continues in a fresh context. Best between tasks.',
+        title: 'Compact now',
+        body: 'Summarizes the conversation to free up context. Earlier messages stay on screen. Best between tasks.',
       },
       threshold: {
-        title: `Hand off at ${tokens(s.handoffAt)}`,
+        title: `Compact at ${tokens(s.handoffAt)}`,
         body: 'Lower resends less history with each message; higher keeps more in one context. Takes effect after Claude’s next reply. Other values: /cost-guard threshold 250k',
       },
       autoHandoff: {
-        title: `Auto handoff · ${s.autoHandoff ? 'On' : 'Off'}`,
-        body: `At ${tokens(s.handoffAt)} tokens, saves a handoff note and continues in a fresh context, so long sessions use less of your limit.`,
+        title: `Auto compact · ${s.autoHandoff ? 'On' : 'Off'}`,
+        body: `At ${tokens(s.handoffAt)} tokens, summarizes the conversation so long sessions use less of your limit. Earlier messages stay on screen.`,
       },
       idleHandoff: {
-        title: `Idle handoff · ${s.idleHandoff ? 'On' : 'Off'}`,
-        body: 'After 50 minutes away, hands off before the cache expires, so your next message doesn’t reprocess the whole conversation.',
+        title: `Idle compact · ${s.idleHandoff ? 'On' : 'Off'}`,
+        body: 'After 50 minutes away, compacts before the cache expires, so your next message doesn’t reprocess the whole conversation.',
       },
       trimOutput: {
         title: `Trim output · ${s.trimOutput ? 'On' : 'Off'}`,
@@ -914,18 +848,18 @@ export const register: Register = on => {
 
     const headline =
       phase.kind === 'writing'
-        ? 'Writing the handoff note…'
+        ? 'Compacting the conversation…'
         : phase.kind === 'clearing'
-          ? 'Clearing and continuing in a fresh context…'
+          ? 'Compacted.'
           : isFresh
-            ? `Fresh start. Freed ${tokens(handoffMark!.freed)} tokens.`
+            ? `Compacted. Freed ${tokens(handoffMark!.freed)} tokens.`
             : !s.autoHandoff
-              ? 'Auto handoff is off. Use Hand off now when the context gets large.'
+              ? 'Auto compact is off. Use Compact now when the context gets large.'
               : fullness < 0.6
-                ? `Plenty of room. Hands off at ${tokens(s.handoffAt)}.`
+                ? `Plenty of room. Compacts at ${tokens(s.handoffAt)}.`
                 : fullness < 0.85
-                  ? `Filling up. Hands off at ${tokens(s.handoffAt)}.`
-                  : `Almost full. Hands off at ${tokens(s.handoffAt)}.`
+                  ? `Filling up. Compacts at ${tokens(s.handoffAt)}.`
+                  : `Almost full. Compacts at ${tokens(s.handoffAt)}.`
     const headlineColor =
       phase.kind !== 'idle' ? 'claude' : isFresh ? 'success' : !s.autoHandoff ? 'subtle' : fullness < 0.6 ? 'success' : fullness < 0.85 ? 'warning' : 'error'
 
@@ -964,16 +898,16 @@ export const register: Register = on => {
             {withTip(
               'handoff-now',
               <Button key="handoff-now" variant="primary" onPress={() => void handOff($, 'manual')}>
-                Hand off now
+                Compact now
               </Button>,
             )}
-            {toggle('autoHandoff', 'Auto handoff', s.autoHandoff)}
-            {toggle('idleHandoff', 'Idle handoff', s.idleHandoff)}
+            {toggle('autoHandoff', 'Auto compact', s.autoHandoff)}
+            {toggle('idleHandoff', 'Idle compact', s.idleHandoff)}
             {toggle('trimOutput', 'Trim output', s.trimOutput)}
             {toggle('cheapSubagents', 'Cheaper subagents', s.cheapSubagents)}
           </Box>
           <Box key="tip-threshold" hover={{ scope: 'tip-threshold' }} flexDirection="row" flexWrap="wrap" alignItems="center" gap={1} marginTop={1}>
-            <Text dimColor>Hand off at</Text>
+            <Text dimColor>Compact at</Text>
             {thresholds.map(value => (
               <Button
                 key={`threshold-${value}`}
@@ -1000,13 +934,13 @@ export const register: Register = on => {
 
         {m.handoffs > 0 && (
           <Text dimColor>
-            Freed {tokens(m.freedTokens)} tokens in {m.handoffs} {m.handoffs === 1 ? 'handoff' : 'handoffs'}.
+            Freed {tokens(m.freedTokens)} tokens in {m.handoffs} {m.handoffs === 1 ? 'compaction' : 'compactions'}.
           </Text>
         )}
 
         <Box flexDirection="column">
           <Text weight="semibold" size="footnote">Recent</Text>
-          {moments.length === 0 && <Text dimColor>Nothing yet. Handoffs, cache misses and trimmed output appear here.</Text>}
+          {moments.length === 0 && <Text dimColor>Nothing yet. Compactions, cache misses and trimmed output appear here.</Text>}
           {moments
             .slice(-6)
             .reverse()

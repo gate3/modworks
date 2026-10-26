@@ -6,7 +6,7 @@ A collection of mods for Claude Code. Each mod lives in its own folder under `pl
 
 | Mod | What it does |
 | --- | --- |
-| [cost-guard](plugins/cost-guard) | A side pane that shows your usage limits and how full the context is. At a threshold you pick, it saves a handoff note and continues in a fresh context. It also trims long tool output. |
+| [cost-guard](plugins/cost-guard) | A side pane that shows your usage limits and how full the context is. At a threshold you pick, it compacts the conversation, and your earlier messages stay on screen. It also trims long tool output. |
 
 ## Install a mod
 

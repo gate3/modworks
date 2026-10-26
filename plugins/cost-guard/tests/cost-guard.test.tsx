@@ -16,16 +16,13 @@ const PANE = {
   },
 } as const
 
-const NOTE = 'STATUS: IN_PROGRESS\n## Goal\nShip the cost guard mod\n## Next steps\nRun the tests'
-
 // The engine beneath the plugin: every call the mod makes is answered here.
-// `beforeNote` runs while the note is being written; `heldPrompts` holds the
-// plugin's own prompts, as the engine does until the session is idle.
-function world(on: On, opts: { beforeNote?: () => Promise<unknown>; heldPrompts?: string[] } = {}) {
+// `veto` makes the compaction come back skipped, as a blocking hook would.
+function world(on: On, opts: { veto?: string } = {}) {
   const clock = mock.clock(on, { now: 1_000_000 })
   mock.store(on)
   mock.env(on, { HOME: '/home/test' })
-  const seen = { commands: [] as string[], prompts: [] as string[], writes: [] as string[], forks: 0 }
+  const seen = { commands: [] as string[], prompts: [] as string[], writes: [] as string[], compactions: [] as (string | undefined)[] }
   on('command.register', (_, e) => ({ value: { command: e.name } }))
   on('ui.open', () => ({ value: { isPlaced: true } }))
   on('ui.status', () => ({ value: undefined }))
@@ -37,28 +34,18 @@ function world(on: On, opts: { beforeNote?: () => Promise<unknown>; heldPrompts?
     seen.writes.push(e.path)
     return { value: undefined }
   })
-  on('model.fork', async () => {
-    seen.forks += 1
-    await opts.beforeNote?.()
-    return {
-      value: {
-        isAnswered: true,
-        text: NOTE,
-        usage: { input_tokens: 10, output_tokens: 400, cache_read_input_tokens: 250_000, cache_creation_input_tokens: 0 },
-      },
-    }
+  on('session.compact', (_, e) => {
+    seen.compactions.push(e.instructions)
+    if (opts.veto) return { skip: opts.veto }
+    return { messages: [{ role: 'user', text: 'Summary', toolUses: [] }], tokensBefore: 250_000, tokensAfter: 18_000 }
   })
   on('command.run', (_, e) => {
     seen.commands.push(e.command)
     return { text: '' }
   })
   on('prompt.submit', (_, e) => {
-    if (opts.heldPrompts && e.origin?.kind === 'plugin') {
-      opts.heldPrompts.push(e.text)
-      return new Promise<never>(() => {})
-    }
     seen.prompts.push(e.text)
-    return { text: e.text, context: e.context }
+    return { text: e.text }
   })
   return { clock, seen }
 }
@@ -82,7 +69,7 @@ test('the pane shows usage and context on every surface', async ($, on) => {
 
   for (const surface of ['terminal', 'desktop', 'vscode', 'mobile'] as const) {
     const ui = await $.ui.mount({ ...PANE, surface })
-    expect(await ui.find({ type: 'Text', text: /Filling up\. Hands off at 200K\./ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /Filling up\. Compacts at 200K\./ })).toBeDefined()
     expect(await ui.find({ key: 'handoff-now' })).toBeDefined()
     await ui.unmount()
   }
@@ -98,7 +85,7 @@ test('every button has a tip that its hover reveals', async ($, on) => {
     expect(await ui.find({ key: `tip-${id}` })).toBeDefined()
     expect(await ui.find({ key: `tip-card-${id}` })).toBeDefined()
   }
-  expect(await ui.find({ type: 'Text', text: /At 200K tokens, saves a handoff note/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /At 200K tokens, summarizes the conversation/ })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: /Point at a button/ })).toBeDefined()
   expect(await ui.find({ key: 'tip-threshold' })).toBeDefined()
   await ui.unmount()
@@ -111,13 +98,13 @@ test('the handoff point can be changed from the pane', async ($, on) => {
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
 
   await ui.press({ key: 'threshold-100000' })
-  expect(await ui.find({ type: 'Text', text: /Hands off at 100K/ })).toBeDefined()
-  // A click never clears on the spot; the next reply does.
+  expect(await ui.find({ type: 'Text', text: /Compacts at 100K/ })).toBeDefined()
+  // A click never compacts on the spot; the next reply does.
   await clock.advance(2_000)
-  expect(seen.commands).toEqual([])
+  expect(seen.compactions).toHaveLength(0)
   await $.turn.complete({ turnId: 't1', reason: 'answer', answer: 'ok', isAborted: false, durationMs: 1_000 })
   await clock.advance(2_000)
-  expect(seen.commands).toEqual(['clear'])
+  expect(seen.compactions).toHaveLength(1)
   await ui.unmount()
 })
 
@@ -145,7 +132,7 @@ test('no dollar figure anywhere, even before the first usage reading', async ($,
   await ui.unmount()
 })
 
-test('auto handoff writes a note, clears, and carries on', async ($, on) => {
+test('auto compact keeps the history: it compacts, never clears or re-prompts', async ($, on) => {
   const { clock, seen } = world(on)
   await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
   await measure($, 250_000)
@@ -153,11 +140,14 @@ test('auto handoff writes a note, clears, and carries on', async ($, on) => {
   await $.turn.complete({ turnId: 't1', reason: 'answer', answer: 'ok', isAborted: false, durationMs: 1_000 })
   await clock.advance(2_000)
 
-  expect(seen.forks).toBe(1)
-  expect(seen.writes[0]).toMatch(/^\/home\/test\/\.claude\/cost-guard\/handoffs\//)
-  expect(seen.commands).toEqual(['clear'])
-  expect(seen.prompts[0]).toContain('Ship the cost guard mod')
-  expect(seen.prompts[0]).toContain('STATUS IN_PROGRESS: continue')
+  expect(seen.compactions).toHaveLength(1)
+  expect(seen.compactions[0]).toContain('STATUS')
+  expect(seen.commands).toEqual([])
+  expect(seen.prompts).toEqual([])
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await ui.find({ type: 'Text', text: /Compacted\. Freed 232K tokens\./ })).toBeDefined()
+  await ui.unmount()
 })
 
 test('no handoff below the threshold, or when turned off', async ($, on) => {
@@ -166,7 +156,7 @@ test('no handoff below the threshold, or when turned off', async ($, on) => {
   await measure($, 120_000)
   await $.turn.complete({ turnId: 't1', reason: 'answer', answer: 'ok', isAborted: false, durationMs: 1_000 })
   await clock.advance(2_000)
-  expect(seen.commands).toEqual([])
+  expect(seen.compactions).toHaveLength(0)
 
   const reply = await $.command.run({
     command: 'cost-guard',
@@ -174,12 +164,11 @@ test('no handoff below the threshold, or when turned off', async ($, on) => {
     origin: { kind: 'composer' },
     presentation: { isFullscreen: false, columns: 100 },
   })
-  expect(reply.text).toBe('Auto handoff is off.')
+  expect(reply.text).toBe('Auto compact is off.')
   await measure($, 400_000)
   await $.turn.complete({ turnId: 't2', reason: 'answer', answer: 'ok', isAborted: false, durationMs: 1_000 })
   await clock.advance(2_000)
-  expect(seen.forks).toBe(0)
-  expect(seen.commands).toEqual([])
+  expect(seen.compactions).toHaveLength(0)
 })
 
 test('an interrupted turn never hands off', async ($, on) => {
@@ -188,7 +177,7 @@ test('an interrupted turn never hands off', async ($, on) => {
   await measure($, 300_000)
   await $.turn.complete({ turnId: 't1', reason: 'aborted', answer: 'ok', isAborted: true, durationMs: 1_000 })
   await clock.advance(2_000)
-  expect(seen.forks).toBe(0)
+  expect(seen.compactions).toHaveLength(0)
 })
 
 test('long Bash output is trimmed and saved', async ($, on) => {
@@ -231,38 +220,19 @@ test('the chosen handoff point is marked and survives a clear', async ($, on) =>
   prefs = { value: undefined, version: 0 }
   await $.classic.SessionStart({ source: 'clear' })
   ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
-  expect(await ui.find({ type: 'Text', text: /Hands off at 300K/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /Compacts at 300K/ })).toBeDefined()
   expect(JSON.stringify(await ui.drawn())).toContain('✓ 300K')
   await ui.unmount()
 })
 
-test('a message sent while the note is written stops the clear', async ($, on) => {
-  // The person replies while the note is being written.
-  const { clock, seen } = world(on, { beforeNote: () => $.turn.start({ turnId: 't2', text: 'Yes, go ahead' }) })
+test('a vetoed compaction is noted and tried again later', async ($, on) => {
+  const { clock, seen } = world(on, { veto: 'a PreCompact hook blocked it' })
   await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
   await measure($, 250_000)
   await $.turn.complete({ turnId: 't1', reason: 'answer', answer: 'ok', isAborted: false, durationMs: 1_000 })
   await clock.advance(2_000)
-  expect(seen.forks).toBe(1)
-  expect(seen.commands).toEqual([])
-  expect(seen.prompts).toEqual([])
-})
-
-test('a message that beats the resume prompt carries the note', async ($, on) => {
-  const held: string[] = []
-  const { clock, seen } = world(on, { heldPrompts: held })
-  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
-  await measure($, 250_000)
-  await $.turn.complete({ turnId: 't1', reason: 'answer', answer: 'ok', isAborted: false, durationMs: 1_000 })
-  await clock.advance(2_000)
-  expect(seen.commands).toEqual(['clear'])
-  expect(held).toHaveLength(1)
-
-  const typed = await $.prompt.submit({ text: 'Make the repo public', origin: { kind: 'composer' }, wait: false })
-  expect(typed.text).toBe('Make the repo public')
-  expect(typed.context?.[0]).toContain('Ship the cost guard mod')
-  expect(typed.context?.[0]).toContain('Answer it, using the note for context')
-
-  const late = await $.prompt.submit({ text: held[0] ?? '', origin: { kind: 'plugin', name: 'cost-guard' }, wait: false })
-  expect(late.drop).toBeDefined()
+  expect(seen.compactions).toHaveLength(1)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await ui.find({ type: 'Text', text: /Compact skipped: a PreCompact hook blocked it/ })).toBeDefined()
+  await ui.unmount()
 })

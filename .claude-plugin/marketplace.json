@@ -8,7 +8,7 @@
     {
       "name": "cost-guard",
       "source": "./plugins/cost-guard",
-      "description": "Helps long Claude Code sessions use less of your usage limits: a live usage and context pane, automatic handoff to a fresh context at a threshold you pick, and trimmed tool output."
+      "description": "Helps long Claude Code sessions use less of your usage limits: a live usage and context pane, automatic compaction at a threshold you pick (your history stays on screen), and trimmed tool output."
     }
   ]
 }
